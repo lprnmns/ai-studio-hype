@@ -2,4 +2,5 @@ hyperliquid-python-sdk
 python-dotenv
 eth-account
 aiohttp
+uvloop
 

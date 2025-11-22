@@ -42,13 +42,13 @@ class HyperliquidConnector:
 
     @staticmethod
     def _token_identifier(token_meta: Dict[str, Any]) -> str:
+        index = token_meta.get("index")
+        if index is not None:
+            return f"@{index}"
         token_id = token_meta.get("tokenId")
         if token_id:
             return token_id
-        index = token_meta.get("index")
-        if index is None:
-            raise ValueError("Token metadata missing both 'tokenId' and 'index'.")
-        return f"@{index}"
+        raise ValueError("Token metadata missing both 'index' and 'tokenId'.")
 
     @staticmethod
     def _format_asset_index(index: Optional[int]) -> str:
@@ -57,36 +57,34 @@ class HyperliquidConnector:
         return f"@{index}"
 
     def get_spot_asset_id(self, symbol: str) -> str:
-        """Resolve the internal asset identifier for a given spot symbol."""
+        """Resolve the tradable spot pair index for a given symbol."""
         symbol_upper = symbol.upper()
         meta = self.info.spot_meta()
         tokens: List[Dict[str, Any]] = meta.get("tokens", [])
+        universe: List[Dict[str, Any]] = meta.get("universe", [])
 
-        for universe_entry in meta.get("universe", []):
-            base_idx, quote_idx = universe_entry.get("tokens", [None, None])
-            candidate_tokens: List[Dict[str, Any]] = []
-            if base_idx is not None and base_idx < len(tokens):
-                candidate_tokens.append(tokens[base_idx])
-            if quote_idx is not None and quote_idx < len(tokens):
-                candidate_tokens.append(tokens[quote_idx])
+        base_token_index: Optional[int] = None
+        for token_meta in tokens:
+            if token_meta.get("name", "").upper() == symbol_upper:
+                base_token_index = token_meta.get("index")
+                break
 
-            for token_meta in candidate_tokens:
-                if token_meta.get("name", "").upper() == symbol_upper:
-                    return self._token_identifier(token_meta)
+        if base_token_index is not None:
+            for universe_entry in universe:
+                pair_tokens = universe_entry.get("tokens", [])
+                if not pair_tokens:
+                    continue
+                base_idx = pair_tokens[0]
+                if base_idx == base_token_index:
+                    return self._format_asset_index(universe_entry.get("index"))
 
+        # Fallback: support callers passing explicit pair names (e.g., HYPE/USDC or @107)
+        for universe_entry in universe:
             pair_name = universe_entry.get("name", "")
-            base_token = tokens[base_idx] if base_idx is not None and base_idx < len(tokens) else None
-            quote_token = tokens[quote_idx] if quote_idx is not None and quote_idx < len(tokens) else None
-            derived_pair_name = (
-                f"{base_token.get('name')}/{quote_token.get('name')}"
-                if base_token and quote_token
-                else ""
-            )
-
-            if pair_name.upper() == symbol_upper or derived_pair_name.upper() == symbol_upper:
+            if pair_name.upper() == symbol_upper:
                 return self._format_asset_index(universe_entry.get("index"))
 
-        # Final fallback: check raw token list
+        # Absolute last resort: return token identifier (should rarely happen)
         for token_meta in tokens:
             if token_meta.get("name", "").upper() == symbol_upper:
                 return self._token_identifier(token_meta)
