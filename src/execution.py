@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import ssl
+import socket
 import threading
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class ExecutionManager:
-    """Async Hyperliquid execution engine that reuses SDK payloads but fires via aiohttp."""
+    """Async Hyperliquid execution engine with optimized networking (IPv4 Force + No SSL Verify)."""
 
     def __init__(self, connector: HyperliquidConnector, symbol: str = "HYPE") -> None:
         self.connector = connector
@@ -36,11 +38,16 @@ class ExecutionManager:
             raise TypeError("HyperliquidConnector.agent_account must be a LocalAccount.")
         self.main_wallet_address = self.wallet.address
         self.master_address = connector.master_address
+        
+        # Original base URL
         self.base_url = getattr(
             self.sdk_exchange,
             "base_url",
             "https://api.hyperliquid.xyz",
         ) or "https://api.hyperliquid.xyz"
+        
+        # Extract Domain (just for logging/debug if needed)
+        self.domain = self.base_url.split("//")[-1].split("/")[0]
 
         self._perp_meta = self.info.meta()
         self._spot_meta = self.info.spot_meta()
@@ -57,18 +64,20 @@ class ExecutionManager:
             meta=self._perp_meta,
             spot_meta=self._spot_meta,
         )
-        # Apply the monkey patch immediately
         self._patch_exchange_post(self.payload_exchange)
 
         self.last_responses: Dict[str, Any] = {}
         
         # Async session management
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
         self._session: Optional[aiohttp.ClientSession] = None
 
     # ------------------------------------------------------------------
-    # Public sync wrappers (for compatibility)
+    # Public sync wrappers
     # ------------------------------------------------------------------
     def setup_account(self) -> Dict[str, Any]:
         print("🛠️ Setting HYPE leverage to 3x")
@@ -81,7 +90,6 @@ class ExecutionManager:
         try:
             self._run_async(self._close_session())
         finally:
-            # self._loop.stop() # Don't stop loop if main runs it, but here we own it
             pass
 
     def execute_entry_ioc(self, size: float, spot_price: float, perp_price: float, spot_asset_id: str) -> bool:
@@ -112,12 +120,9 @@ class ExecutionManager:
             raise ValueError("Order size must be positive.")
 
         spot_coin = self._spot_coin_from_asset_id(spot_asset_id)
-        # SDK handles significant figures automatically via internal logic if we pass floats
-        # But we double check our rounding logic.
         spot_limit = self._round_to_sig_figs(spot_price * 1.05)
         perp_limit = self._round_to_sig_figs(perp_price * 0.95)
 
-        # Generate payloads using the SDK (Guaranteed Correctness)
         spot_payload = self._sdk_build_payload(
             coin_name=spot_coin,
             is_buy=True,
@@ -145,7 +150,6 @@ class ExecutionManager:
         spot_ok = self._is_success(spot_resp)
         perp_ok = self._is_success(perp_resp)
 
-        # Strict hedge check
         if spot_ok and perp_ok and self._fills_match(spot_fill, perp_fill, request_size):
             return True
 
@@ -212,18 +216,40 @@ class ExecutionManager:
         return False
 
     # ------------------------------------------------------------------
-    # Networking / signing
+    # Networking / signing (OPTIMIZED - NO CUSTOM RESOLVER)
     # ------------------------------------------------------------------
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=5)
+            # 1. Optimized SSL Context
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # 2. Optimized TCP Connector (Matches test_ultra_fast.py exactly)
             connector = aiohttp.TCPConnector(
-                limit=100,
-                ttl_dns_cache=300,
+                limit=0, 
+                ttl_dns_cache=None, # Infinite DNS Cache
+                use_dns_cache=True,
                 force_close=False,
-                enable_cleanup_closed=True
+                enable_cleanup_closed=False,
+                ssl=ssl_context,
+                family=socket.AF_INET # Force IPv4
             )
-            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            
+            # 3. Create Session
+            timeout = aiohttp.ClientTimeout(total=5, connect=2, sock_read=2)
+            headers = {
+                "Content-Type": "application/json", 
+                "Connection": "keep-alive"
+            }
+            
+            self._session = aiohttp.ClientSession(
+                base_url=self.base_url, 
+                timeout=timeout, 
+                connector=connector,
+                headers=headers,
+                json_serialize=json.dumps
+            )
 
     async def _close_session(self) -> None:
         if self._session and not self._session.closed:
@@ -248,7 +274,6 @@ class ExecutionManager:
         try:
             for label, task in tasks.items():
                 results[label] = await task
-                # Minimal logging for speed
                 if not self._is_success(results[label]):
                     print(f"📬 {label.upper()} FAIL: {results[label]}")
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -260,9 +285,8 @@ class ExecutionManager:
 
     async def _post_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         assert self._session is not None
-        url = f"{self.base_url.rstrip('/')}/exchange"
-        headers = {"Content-Type": "application/json"}
-        async with self._session.post(url, json=payload, headers=headers) as resp:
+        url = "/exchange"
+        async with self._session.post(url, json=payload) as resp:
             text = await resp.text()
             try:
                 return json.loads(text)
@@ -317,8 +341,6 @@ class ExecutionManager:
         tif: str = "Ioc",
     ) -> Dict[str, Any]:
         try:
-            # This calls the SDK's order method, which calls our patched 'post'
-            # Our patched 'post' returns the payload dictionary directly.
             return self.payload_exchange.order(
                 name=coin_name,
                 is_buy=is_buy,
@@ -348,13 +370,10 @@ class ExecutionManager:
     @staticmethod
     def _patch_exchange_post(exchange: Exchange) -> None:
         def _return_payload(self, path, payload=None, **kwargs):
-            # The SDK calls post(path, json=payload)
             body = payload
             if body is None:
                 body = kwargs.get("json")
             return body
-
-        # Bind the new method to the instance
         exchange.post = MethodType(_return_payload, exchange)
 
     def _extract_filled_size(self, response: Any) -> float:
@@ -432,19 +451,28 @@ class ExecutionManager:
 
     def _run_async(self, coro):
         """Helper to run async code from sync context."""
+        if self._loop.is_running():
+             raise RuntimeError("Cannot call sync wrapper from inside an event loop. Use await async_method() instead.")
         return self._loop.run_until_complete(coro)
 
     async def run_heartbeat(self) -> None:
-        """Periodically sends a lightweight request to keep the connection warm."""
+        """Periodically sends lightweight requests to keep the connection pool warm."""
+        logger.info("💓 Aggressive heartbeat started (0.5s interval, 2 connections)...")
         while True:
-            await asyncio.sleep(30)  # Send heartbeat every 30 seconds
+            await asyncio.sleep(0.5)
             if self._session and not self._session.closed:
                 try:
-                    url = f"{self.base_url}/info"
-                    headers = {"Content-Type": "application/json"}
-                    payload = {"type": "meta"} # Lightweight request
-                    async with self._session.post(url, json=payload, headers=headers) as resp:
-                         await resp.text() # Consume response
-                         # logger.info(f"💓 Heartbeat sent. Status: {resp.status}") # Optional logging
+                    # Use user state as it touches the matching engine backend
+                    url = "/info"
+                    payload = {"type": "clearinghouseState", "user": self.master_address}
+                    
+                    # Fire 2 concurrent requests to keep multiple sockets open in the pool
+                    tasks = [self._session.post(url, json=payload) for _ in range(2)]
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    for resp in responses:
+                        if not isinstance(resp, Exception):
+                            await resp.read()
+                            
                 except Exception as e:
                     logger.warning(f"⚠️ Heartbeat failed: {e}")

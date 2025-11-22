@@ -6,6 +6,7 @@ import time
 import traceback
 import sys
 import aiohttp
+import socket
 
 from src.bot import ArbitrageBot
 from src.connector import HyperliquidConnector
@@ -19,6 +20,27 @@ class ProfilingExecutionManager(ExecutionManager):
     def __init__(self, connector):
         super().__init__(connector)
         self.timings = {}
+
+    async def run_heartbeat(self) -> None:
+        """Aggressive 0.5s heartbeat keeping 2 connections warm."""
+        print("💓 Heartbeat started (0.5s interval, 2 conns)...")
+        while True:
+            await asyncio.sleep(0.5)
+            if self._session and not self._session.closed:
+                try:
+                    t0 = time.perf_counter()
+                    url = "/info"
+                    payload = {"type": "clearinghouseState", "user": self.master_address}
+                    # Keep 2 connections alive
+                    tasks = [self._session.post(url, json=payload) for _ in range(2)]
+                    responses = await asyncio.gather(*tasks, return_exceptions=True)
+                    for resp in responses:
+                        if not isinstance(resp, Exception):
+                            await resp.read()
+                    t1 = time.perf_counter()
+                    # print(f"💓 Heartbeat RTT: {(t1-t0)*1000:.1f} ms")
+                except Exception as e:
+                    print(f"⚠️ Heartbeat failed: {e}")
 
     async def execute_entry_parallel(self, size, spot_price, perp_price, spot_asset_id):
         self.timings = {} # Reset
@@ -141,17 +163,37 @@ async def main():
     
     await execution._ensure_session()
     
-    # Isınma
-    print("📡 Kanal Isıtılıyor...")
+    # Start aggressive heartbeat
+    asyncio.create_task(execution.run_heartbeat())
+
+    # Isınma (Warmup - MULTI-CONNECTION)
+    try:
+        ip = socket.gethostbyname("api.hyperliquid.xyz")
+        print(f"🔍 Resolved IP: {ip}")
+    except:
+        pass
+
+    print("📡 Kanal Isıtılıyor (2 Bağlantı)...")
     try:
         url = f"{execution.base_url}/info"
         headers = {"Content-Type": "application/json"}
         payload = {"type": "meta"}
-        async with execution._session.post(url, json=payload, headers=headers) as resp:
-            await resp.text()
-            print(f"✅ Kanal Hazır (HTTP {resp.status})")
-    except Exception:
-        pass
+        
+        # Send 2 requests in parallel
+        tasks = []
+        for _ in range(2):
+             tasks.append(execution._session.post(url, json=payload, headers=headers))
+        
+        responses = await asyncio.gather(*tasks)
+        for resp in responses:
+            await resp.read()
+            
+        print(f"✅ Kanal Hazır ({len(responses)} bağlantı ısıtıldı)")
+        
+        # Wait a bit to settle
+        await asyncio.sleep(1)
+    except Exception as e:
+        print(f"⚠️ Warmup Failed: {e}")
     
     bot = LatencyTestBot(connector, execution)
     
